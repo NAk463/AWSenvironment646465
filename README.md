@@ -2,7 +2,8 @@
 
 実業務で起きた AWS 関連の障害を、個人 PC 上で再現・解析するための環境です。
 
-- **awsemu** (`emulator/`): LocalStack や Moto を使わない自作の AWS エミュレータ。AWS CLI / SDK から S3・SQS・DynamoDB・STS をそのまま叩けます。内部状態の表示、API 呼び出し履歴、障害注入、時計の操作ができます → [emulator/README.md](emulator/README.md)
+- **awsemu** (`emulator/`): LocalStack や Moto を使わない自作の AWS エミュレータ。AWS CLI / SDK から S3・SQS・DynamoDB・IAM・STS・CloudTrail・CloudWatch・CloudWatch Logs をそのまま叩けます。現場で見るもの (アラーム、メトリクス、ログ、CloudTrail、AccessDenied) を本物と同じ形式で再現します → [emulator/README.md](emulator/README.md)
+- **要件定義とロードマップ**: [docs/requirements.md](docs/requirements.md) (サーバーレス / VM・ネットワーク層 / ワークフロー / データ基盤まで段階的に拡張予定)
 - **install.sh**: AWS CLI などの周辺ツールを自動インストールします
 
 ## クイックスタート (awsemu)
@@ -16,15 +17,20 @@ aws --profile localstack s3 mb s3://demo            # 本物の AWS CLI で操�
 aws --profile localstack sqs create-queue --queue-name jobs
 awsemu state                                        # 内部状態を確認
 awsemu events --errors                              # エラーになった API 呼び出し
-awsemu fault add --service dynamodb --operation PutItem \
-  --error ProvisionedThroughputExceededException --status 400 --probability 0.5
-awsemu time advance 60                              # 可視性タイムアウトや TTL を早送り
+aws --profile localstack cloudwatch describe-alarms   # アラーム
+aws --profile localstack logs tail /app/api --follow  # ログ
+aws --profile localstack cloudtrail lookup-events     # 誰が何をしたか
+awsemu time advance 60                              # 時計を早送り (アラーム評価・可視性タイムアウト・TTL)
 ```
 
 `localstack` プロファイルは install.sh が作る「endpoint_url=http://localhost:4566」の AWS CLI プロファイルです。名前に反して awsemu にもそのまま使えます。
 
-障害再現のサンプル: `./examples/scenario-visibility-timeout.sh`
-(SQS の可視性タイムアウト超過による二重処理と、古い ReceiptHandle での削除が効かない問題を再現)
+障害対応の訓練シナリオ:
+
+| スクリプト | 内容 |
+| --- | --- |
+| `examples/scenario-throttling-incident.sh` | 「注文 API のエラー急増」を、監視担当 (アラーム) → 運用 (メトリクス・Logs Insights) → インフラ/上級 (CloudTrail で誰が DynamoDB の容量を下げたか特定) → 復旧、の流れで追体験 |
+| `examples/scenario-visibility-timeout.sh` | SQS の可視性タイムアウト超過による二重処理と、古い ReceiptHandle での削除が効かない問題 |
 
 ## install.sh で導入されるツール
 

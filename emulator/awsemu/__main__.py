@@ -6,6 +6,7 @@
   python -m awsemu fault add --service dynamodb --operation PutItem --error ProvisionedThroughputExceededException --status 400
   python -m awsemu fault list | fault rm <id> | fault clear
   python -m awsemu time advance 60
+  python -m awsemu config [--iam enforce|off] [--root-keys test,admin]
   python -m awsemu reset [--service s3]
   python -m awsemu snapshot save FILE | snapshot load FILE
 """
@@ -64,7 +65,8 @@ def cmd_serve(args: argparse.Namespace) -> None:
 
     signal.signal(signal.SIGTERM, shutdown)
     signal.signal(signal.SIGINT, shutdown)
-    print(f"awsemu listening on http://{args.host}:{args.port}  (services: s3, sqs, dynamodb, sts)", file=sys.stderr)
+    print(f"awsemu listening on http://{args.host}:{args.port}  (services: {', '.join(sorted(emu.services))}, "
+          f"iam={emu.iam_mode})", file=sys.stderr)
     server.serve_forever()
 
 
@@ -88,15 +90,19 @@ def cmd_events(args: argparse.Namespace) -> None:
     while True:
         for e in call(args.url, "GET", f"{query}&since={since}"):
             since = e["seq"]
-            print_event(e) if not args.json else print(json.dumps(e, ensure_ascii=False))
+            if args.json:
+                print(json.dumps(e, ensure_ascii=False))
+            else:
+                print_event(e)
         time.sleep(0.5)
 
 
 def print_event(e: dict[str, Any]) -> None:
     err = f"  {e['error']['code']}: {e['error']['message']}" if e.get("error") else ""
     fault = f"  [fault {e['fault_id']}]" if e.get("fault_id") else ""
-    print(f"#{e['seq']:<5} {e['time'][11:23]} {e['service']:<8} {e['operation']:<26} "
-          f"{e['resource'][:40]:<40} {e['status']}{err}{fault}")
+    who = (e.get("principal") or "").split(":", 5)[-1]
+    print(f"#{e['seq']:<5} {e['time'][11:23]} {e['service']:<10} {e['operation']:<26} "
+          f"{e['resource'][:36]:<36} {who[:28]:<28} {e['status']}{err}{fault}")
 
 
 def cmd_fault(args: argparse.Namespace) -> None:
@@ -173,6 +179,13 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("seconds", nargs="?", type=float, default=0)
     p.set_defaults(func=lambda a: show(call(a.url, "POST", "time", {"advance_seconds": a.seconds})
                                        if a.action == "advance" else call(a.url, "GET", "time")))
+
+    p = sub.add_parser("config", help="IAM の強制モードなどの設定を表示/変更する")
+    p.add_argument("--iam", choices=["enforce", "off"], help="enforce: 認証・認可を行う / off: すべて root 扱い")
+    p.add_argument("--root-keys", help="root として扱うアクセスキー (カンマ区切り)")
+    p.set_defaults(func=lambda a: show(call(a.url, "POST", "config", {
+        **({"iam": a.iam} if a.iam else {}),
+        **({"root_access_keys": a.root_keys.split(",")} if a.root_keys else {})})))
 
     p = sub.add_parser("reset", help="状態を初期化する")
     p.add_argument("--service")

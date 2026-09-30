@@ -13,6 +13,8 @@ services:
     volumes:
       - "awsemu-data:/data"              # 停止時に state.json へ保存し、次回起動時に復元
     environment:
+      AWSEMU_IAM: ${AWSEMU_IAM:-enforce}                 # off にすると認証・認可を行わない
+      AWSEMU_ROOT_ACCESS_KEYS: ${AWSEMU_ROOT_ACCESS_KEYS:-test}
       AWSEMU_DDB_TTL_DELAY: ${AWSEMU_DDB_TTL_DELAY:-0}
 
   localstack:

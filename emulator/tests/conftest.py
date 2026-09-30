@@ -9,7 +9,7 @@ from awsemu.server import make_server
 
 @pytest.fixture(scope="session")
 def server():
-    srv = make_server("127.0.0.1", 0, verbose=False)
+    srv = make_server("127.0.0.1", 0, verbose=False, background=False)
     thread = threading.Thread(target=srv.serve_forever, daemon=True)
     thread.start()
     yield srv
@@ -24,6 +24,7 @@ def emulator(server):
     emu.faults.clear()
     emu.events.clear()
     emu.clock.offset = 0
+    emu.iam_mode = "enforce"
     return emu
 
 
@@ -34,10 +35,10 @@ def endpoint(server):
 
 @pytest.fixture
 def client(endpoint, emulator):
-    def make(service):
+    def make(service, key="test", secret="test", token=None):
         return boto3.client(
             service, endpoint_url=endpoint, region_name="ap-northeast-1",
-            aws_access_key_id="test", aws_secret_access_key="test",
+            aws_access_key_id=key, aws_secret_access_key=secret, aws_session_token=token,
             config=Config(retries={"total_max_attempts": 1}),
         )
     return make

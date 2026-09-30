@@ -9,13 +9,14 @@ from ..core import AwsError, Request, Response, Service
 
 class JsonService(Service):
     target_prefix = ""
+    json_version = "1.0"
     error_namespace = ""
     # awsQueryCompatible なサービス (SQS) 用: 新エラーコード -> 旧 Query API のエラーコード
     query_error_codes: dict[str, str] = {}
 
     def operation(self, req: Request) -> str:
         target = req.header("X-Amz-Target") or ""
-        return target.split(".", 1)[1] if "." in target else "Unknown"
+        return target.rsplit(".", 1)[1] if "." in target else "Unknown"
 
     def params(self, req: Request) -> dict[str, Any]:
         if not req.body:
@@ -40,10 +41,10 @@ class JsonService(Service):
             raise AwsError("UnknownOperationException", f"Operation {op} is not implemented by awsemu")
         result = method(self.params(req), req)
         return Response(200, json.dumps(result or {}).encode(),
-                        {"Content-Type": "application/x-amz-json-1.0"})
+                        {"Content-Type": f"application/x-amz-json-{self.json_version}"})
 
     def error_response(self, req: Request, err: AwsError) -> Response:
-        headers = {"Content-Type": "application/x-amz-json-1.0", "x-amzn-ErrorType": err.code}
+        headers = {"Content-Type": f"application/x-amz-json-{self.json_version}", "x-amzn-ErrorType": err.code}
         if self.query_error_codes:
             legacy = self.query_error_codes.get(err.code, err.code)
             headers["x-amzn-query-error"] = f"{legacy};{'Sender' if err.sender_fault else 'Receiver'}"

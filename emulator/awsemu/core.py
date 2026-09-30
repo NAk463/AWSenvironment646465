@@ -30,6 +30,45 @@ class AwsError(Exception):
 
 
 @dataclass
+class Identity:
+    """リクエストの呼び出し元 (CloudTrail の userIdentity に相当)。"""
+
+    type: str                      # Root | IAMUser | AssumedRole | AWSService | Anonymous
+    arn: str
+    principal_id: str
+    account: str = ACCOUNT_ID
+    user_name: str | None = None
+    access_key: str | None = None
+    role_arn: str | None = None     # AssumedRole の元ロール
+    role_id: str | None = None
+    session_name: str | None = None
+    session_created: float | None = None
+
+    @property
+    def is_root(self) -> bool:
+        return self.type == "Root"
+
+    @property
+    def display_name(self) -> str:
+        if self.type == "Root":
+            return "root"
+        if self.type == "AssumedRole":
+            return self.session_name or ""
+        return self.user_name or self.arn
+
+    def principal_arns(self) -> set[str]:
+        """リソースポリシーの Principal と照合する ARN 群。"""
+        arns = {self.arn}
+        if self.role_arn:
+            arns.add(self.role_arn)
+        return arns
+
+
+ROOT_IDENTITY = Identity("Root", f"arn:aws:iam::{ACCOUNT_ID}:root", ACCOUNT_ID)
+ANONYMOUS = Identity("Anonymous", "*", "", account="anonymous")
+
+
+@dataclass
 class Request:
     method: str
     raw_path: str
@@ -37,12 +76,16 @@ class Request:
     body: bytes
     region: str = DEFAULT_REGION
     request_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    client_ip: str = "127.0.0.1"
 
     def __post_init__(self) -> None:
         parts = urlsplit(self.raw_path)
         self.path = parts.path
         self.query_string = parts.query
         self.query = {k: v[-1] for k, v in parse_qs(parts.query, keep_blank_values=True).items()}
+        self.identity: Identity = ROOT_IDENTITY
+        # サービスがハンドラ内で記録する付随情報 (消費キャパシティ、転送バイト数など)。メトリクス発行に使う
+        self.ctx: dict[str, Any] = {}
 
     def header(self, name: str, default: str | None = None) -> str | None:
         return self.headers.get(name, default)
@@ -160,14 +203,67 @@ class FaultInjector:
         return None
 
 
+@dataclass
+class Metric:
+    """サービスが発行する CloudWatch メトリクスの 1 データポイント。"""
+
+    namespace: str
+    name: str
+    value: float
+    dimensions: dict[str, str] = field(default_factory=dict)
+    unit: str = "None"
+    timestamp: float | None = None
+
+
+READ_PREFIXES = ("Get", "List", "Describe", "Head", "Lookup", "Query", "Scan", "BatchGet", "TransactGet",
+                 "Filter", "Receive", "Simulate", "Select", "Test")
+
+
 class Service:
     """サービス実装の基底クラス。"""
 
     name = ""
+    iam_prefix = ""                       # IAM アクションの接頭辞 (s3, sqs, dynamodb ...)
+    event_source = ""                     # CloudTrail の eventSource
+    data_events: frozenset[str] = frozenset()   # CloudTrail でデータイベント扱いのオペレーション
+    access_denied_code = "AccessDenied"
+    access_denied_status = 403
+    invalid_token_code = "InvalidClientTokenId"
+    invalid_token_status = 403
+    invalid_token_message = "The security token included in the request is invalid."
 
     def __init__(self, clock: Clock) -> None:
         self.clock = clock
         self.lock = threading.RLock()
+        self.emu: Any = None              # Emulator。サービス間連携で使う
+
+    # --- 認可 / 監査 / メトリクス ---
+    def authz(self, req: Request, op: str) -> list[tuple[str, str]]:
+        """このリクエストに必要な (IAM アクション, リソース ARN) の一覧。"""
+        return [(f"{self.iam_prefix}:{op}", "*")]
+
+    def authz_context(self, req: Request, op: str) -> dict[str, Any]:
+        """サービス固有の条件キー (s3:prefix など)。"""
+        return {}
+
+    def resource_policy(self, arn: str) -> dict[str, Any] | None:
+        """リソースベースポリシー (バケットポリシー、キューポリシーなど)。"""
+        return None
+
+    def read_only(self, op: str) -> bool:
+        return op.startswith(READ_PREFIXES)
+
+    def trail_resources(self, req: Request, op: str) -> list[dict[str, str]]:
+        return []
+
+    def metrics(self, req: Request, op: str, status: int, error: "AwsError | None",
+                duration_ms: float) -> list[Metric]:
+        """1 リクエストごとに発行するメトリクス (カウンタ類)。"""
+        return []
+
+    def gauges(self) -> list[Metric]:
+        """定期的にサンプリングするメトリクス (キューの滞留数など)。"""
+        return []
 
     # --- プロトコル ---
     def operation(self, req: Request) -> str:

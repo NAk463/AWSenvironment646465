@@ -14,7 +14,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
-from ..core import ACCOUNT_ID, AwsError, Request
+from ..core import ACCOUNT_ID, AwsError, Metric, Request
 from ._json import JsonService
 
 DEFAULT_ATTRIBUTES = {
@@ -104,6 +104,10 @@ class SQS(JsonService):
     name = "sqs"
     target_prefix = "AmazonSQS."
     error_namespace = "com.amazonaws.sqs"
+    iam_prefix = "sqs"
+    event_source = "sqs.amazonaws.com"
+    data_events = frozenset({"SendMessage", "SendMessageBatch", "ReceiveMessage", "DeleteMessage",
+                             "DeleteMessageBatch", "ChangeMessageVisibility", "ChangeMessageVisibilityBatch"})
     query_error_codes = {
         "QueueDoesNotExist": "AWS.SimpleQueueService.NonExistentQueue",
         "QueueNameExists": "QueueAlreadyExists",
@@ -121,6 +125,62 @@ class SQS(JsonService):
         self.queues: dict[str, Queue] = {}
 
     # ------------------------------------------------------------------ helpers
+    # ------------------------------------------------------------------ IAM / CloudTrail / メトリクス
+    BATCH_ACTIONS = {"SendMessageBatch": "SendMessage", "DeleteMessageBatch": "DeleteMessage",
+                     "ChangeMessageVisibilityBatch": "ChangeMessageVisibility"}
+
+    def _arn(self, name: str, region: str) -> str:
+        q = self.queues.get(name)
+        return q.arn if q else f"arn:aws:sqs:{region}:{ACCOUNT_ID}:{name}"
+
+    def authz(self, req: Request, op: str) -> list[tuple[str, str]]:
+        action = f"sqs:{self.BATCH_ACTIONS.get(op, op)}"
+        if op == "ListQueues":
+            return [(action, "*")]
+        return [(action, self._arn(self.resource(req, op), req.region))]
+
+    def resource_policy(self, arn: str) -> dict[str, Any] | None:
+        q = self.queues.get(arn.rsplit(":", 1)[-1])
+        policy = q.attributes.get("Policy") if q else None
+        return json.loads(policy) if policy else None
+
+    def trail_resources(self, req: Request, op: str) -> list[dict[str, str]]:
+        name = self.resource(req, op)
+        return [{"accountId": ACCOUNT_ID, "type": "AWS::SQS::Queue", "ARN": self._arn(name, req.region)}] if name else []
+
+    def metrics(self, req: Request, op: str, status: int, error, duration_ms: float) -> list[Metric]:
+        stats = req.ctx.get("sqs")
+        if not stats or error is not None:
+            return []
+        dims = {"QueueName": stats["queue"]}
+        out = []
+        if "sent" in stats:
+            out.append(Metric("AWS/SQS", "NumberOfMessagesSent", float(stats["sent"]), dims, "Count"))
+            out.extend(Metric("AWS/SQS", "SentMessageSize", float(size), dims, "Bytes") for size in stats["sizes"])
+        if "received" in stats:
+            out.append(Metric("AWS/SQS", "NumberOfMessagesReceived", float(stats["received"]), dims, "Count"))
+            out.append(Metric("AWS/SQS", "NumberOfEmptyReceives", 0.0 if stats["received"] else 1.0, dims, "Count"))
+        if "deleted" in stats:
+            out.append(Metric("AWS/SQS", "NumberOfMessagesDeleted", float(stats["deleted"]), dims, "Count"))
+        return out
+
+    def gauges(self) -> list[Metric]:
+        with self.lock:
+            now = self.clock.now()
+            out = []
+            for q in self.queues.values():
+                self._expire(q, now)
+                dims = {"QueueName": q.name}
+                visible = sum(1 for m in q.messages if m.visible_at <= now)
+                inflight = sum(1 for m in q.messages if m.visible_at > now and m.receive_count)
+                oldest = max((now - m.sent for m in q.messages), default=0.0)
+                out += [Metric("AWS/SQS", "ApproximateNumberOfMessagesVisible", float(visible), dims, "Count"),
+                        Metric("AWS/SQS", "ApproximateNumberOfMessagesNotVisible", float(inflight), dims, "Count"),
+                        Metric("AWS/SQS", "ApproximateNumberOfMessagesDelayed",
+                               float(len(q.messages) - visible - inflight), dims, "Count"),
+                        Metric("AWS/SQS", "ApproximateAgeOfOldestMessage", float(int(oldest)), dims, "Seconds")]
+            return out
+
     def resource(self, req: Request, op: str) -> str:
         p = self.params_for_log(req, op) or {}
         return p.get("QueueName") or str(p.get("QueueUrl", "")).rsplit("/", 1)[-1]
@@ -320,7 +380,10 @@ class SQS(JsonService):
 
     def op_SendMessage(self, p, req):
         with self.lock:
-            return self._enqueue(self._queue(p), p)
+            q = self._queue(p)
+            result = self._enqueue(q, p)
+            req.ctx["sqs"] = {"queue": q.name, "sent": 1, "sizes": [len(p["MessageBody"].encode())]}
+            return result
 
     @staticmethod
     def _check_batch(entries: list[dict[str, Any]]) -> None:
@@ -344,6 +407,9 @@ class SQS(JsonService):
                 except AwsError as err:
                     failed.append({"Id": e["Id"], "SenderFault": err.sender_fault, "Code": err.code,
                                    "Message": err.message})
+            req.ctx["sqs"] = {"queue": q.name, "sent": len(ok),
+                              "sizes": [len(e["MessageBody"].encode()) for e in entries
+                                        if e["Id"] in {x["Id"] for x in ok}]}
         return {"Successful": ok, "Failed": failed}
 
     def op_ReceiveMessage(self, p, req):
@@ -362,6 +428,7 @@ class SQS(JsonService):
                     raise AwsError("QueueDoesNotExist", "The specified queue does not exist.")
                 received = self._receive(q, p, max_n)
             if received or time.monotonic() >= deadline:
+                req.ctx["sqs"] = {"queue": q.name, "received": len(received)}
                 return {"Messages": received} if received else {}
             time.sleep(0.05)
 
@@ -449,6 +516,8 @@ class SQS(JsonService):
                                    f'The input receipt handle "{p["ReceiptHandle"]}" is not a valid receipt handle.')
                 return  # 古い受信ハンドル: AWS は成功を返す
             q.messages.remove(m)
+            stats = req.ctx.setdefault("sqs", {"queue": q.name, "deleted": 0})
+            stats["deleted"] = stats.get("deleted", 0) + 1
 
     def op_DeleteMessageBatch(self, p, req):
         entries = p.get("Entries") or []

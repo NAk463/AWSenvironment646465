@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import base64
+import json
 import hashlib
 import os
 import re
@@ -14,16 +15,17 @@ from typing import Any
 from urllib.parse import unquote
 from xml.sax.saxutils import escape
 
-from ..core import AwsError, Request, Response, Service
+from ..core import ACCOUNT_ID, AwsError, Metric, Request, Response, Service
+from ..iam_policy import parse_document
 
 NS = "http://s3.amazonaws.com/doc/2006-03-01/"
 BUCKET_RE = re.compile(r"^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$")
 HOST_SUFFIX = "." + os.environ.get("AWSEMU_HOSTNAME", "localhost")
 SIGNATURE_PARAMS = {"AWSAccessKeyId", "Signature", "Expires"}
 UNSUPPORTED_SUBRESOURCES = {
-    "acl", "policy", "tagging", "cors", "lifecycle", "website", "notification",
+    "acl", "tagging", "cors", "lifecycle", "website", "notification",
     "encryption", "replication", "logging", "object-lock", "ownershipControls",
-    "publicAccessBlock", "intelligent-tiering", "inventory", "metrics", "analytics",
+    "publicAccessBlock", "intelligent-tiering", "inventory", "analytics",
     "accelerate", "requestPayment", "restore", "select", "torrent", "legal-hold", "retention",
     "versions",
 }
@@ -54,6 +56,8 @@ class Bucket:
     created: float
     objects: dict[str, S3Object] = field(default_factory=dict)
     uploads: dict[str, Upload] = field(default_factory=dict)
+    policy: str | None = None
+    metrics_configs: dict[str, str] = field(default_factory=dict)   # id -> プレフィックスフィルタ ("" は全体)
 
 
 def iso(ts: float) -> str:
@@ -103,8 +107,31 @@ def child_text(elem: ET.Element, name: str) -> str | None:
     return found[0].text if found else None
 
 
+OP_ACTIONS = {
+    "ListBuckets": "s3:ListAllMyBuckets", "HeadBucket": "s3:ListBucket", "ListObjects": "s3:ListBucket",
+    "ListObjectsV2": "s3:ListBucket", "HeadObject": "s3:GetObject", "CreateMultipartUpload": "s3:PutObject",
+    "UploadPart": "s3:PutObject", "CompleteMultipartUpload": "s3:PutObject", "ListParts": "s3:ListMultipartUploadParts",
+    "ListMultipartUploads": "s3:ListBucketMultipartUploads", "DeleteObjects": "s3:DeleteObject",
+    "PutBucketMetricsConfiguration": "s3:PutMetricsConfiguration",
+    "GetBucketMetricsConfiguration": "s3:GetMetricsConfiguration",
+    "DeleteBucketMetricsConfiguration": "s3:PutMetricsConfiguration",
+    "ListBucketMetricsConfigurations": "s3:GetMetricsConfiguration",
+}
+OBJECT_OPS = {"PutObject", "GetObject", "HeadObject", "DeleteObject", "CopyObject", "CreateMultipartUpload",
+              "UploadPart", "CompleteMultipartUpload", "AbortMultipartUpload", "ListParts"}
+DATA_EVENTS = OBJECT_OPS | {"DeleteObjects", "ListObjects", "ListObjectsV2", "ListMultipartUploads"}
+REQUEST_KIND = {"GET": "GetRequests", "PUT": "PutRequests", "DELETE": "DeleteRequests", "HEAD": "HeadRequests",
+                "POST": "PostRequests"}
+
+
 class S3(Service):
     name = "s3"
+    iam_prefix = "s3"
+    event_source = "s3.amazonaws.com"
+    data_events = frozenset(DATA_EVENTS)
+    invalid_token_code = "InvalidAccessKeyId"
+    invalid_token_message = "The AWS Access Key Id you provided does not exist in our records."
+    expired_token_status = 400
 
     def __init__(self, clock) -> None:
         super().__init__(clock)
@@ -130,6 +157,13 @@ class S3(Service):
         if UNSUPPORTED_SUBRESOURCES & q.keys():
             return "Unsupported"
         if key is None:
+            if "policy" in q:
+                return {"PUT": "PutBucketPolicy", "GET": "GetBucketPolicy", "DELETE": "DeleteBucketPolicy"}.get(m, "Unknown")
+            if "metrics" in q:
+                if m == "GET" and "id" not in q:
+                    return "ListBucketMetricsConfigurations"
+                return {"PUT": "PutBucketMetricsConfiguration", "GET": "GetBucketMetricsConfiguration",
+                        "DELETE": "DeleteBucketMetricsConfiguration"}.get(m, "Unknown")
             if m == "PUT":
                 return "PutBucketVersioning" if "versioning" in q else "CreateBucket"
             if m == "DELETE":
@@ -167,6 +201,84 @@ class S3(Service):
     def resource(self, req: Request, op: str) -> str:
         bucket, key = self._locate(req)
         return "/".join(p for p in (bucket, key) if p)
+
+    # ------------------------------------------------------------------ IAM / CloudTrail / メトリクス
+    def authz(self, req: Request, op: str) -> list[tuple[str, str]]:
+        bucket, key = self._locate(req)
+        action = OP_ACTIONS.get(op, f"s3:{op}")
+        if op == "ListBuckets":
+            return [(action, "*")]
+        if op == "CopyObject":
+            source = unquote(req.header("x-amz-copy-source") or "").split("?", 1)[0].lstrip("/")
+            return [("s3:GetObject", f"arn:aws:s3:::{source}"), ("s3:PutObject", f"arn:aws:s3:::{bucket}/{key}")]
+        if op == "DeleteObjects":
+            try:
+                root = ET.fromstring(self._payload(req))
+                keys = [child_text(o, "Key") or "" for o in children(root, "Object")]
+            except (ET.ParseError, ValueError, AwsError):
+                keys = []
+            return [(action, f"arn:aws:s3:::{bucket}/{k}") for k in keys] or [(action, f"arn:aws:s3:::{bucket}/*")]
+        if op in OBJECT_OPS:
+            return [(action, f"arn:aws:s3:::{bucket}/{key}")]
+        return [(action, f"arn:aws:s3:::{bucket}")]
+
+    def authz_context(self, req: Request, op: str) -> dict[str, Any]:
+        if op in ("ListObjects", "ListObjectsV2"):
+            return {"s3:prefix": req.query.get("prefix", ""), "s3:delimiter": req.query.get("delimiter"),
+                    "s3:max-keys": req.query.get("max-keys")}
+        return {}
+
+    def resource_policy(self, arn: str) -> dict[str, Any] | None:
+        bucket = arn.removeprefix("arn:aws:s3:::").split("/", 1)[0]
+        b = self.buckets.get(bucket)
+        return json.loads(b.policy) if b and b.policy else None
+
+    def trail_resources(self, req: Request, op: str) -> list[dict[str, str]]:
+        bucket, key = self._locate(req)
+        out = []
+        if key:
+            out.append({"type": "AWS::S3::Object", "ARN": f"arn:aws:s3:::{bucket}/{key}"})
+        if bucket:
+            out.append({"accountId": ACCOUNT_ID, "type": "AWS::S3::Bucket", "ARN": f"arn:aws:s3:::{bucket}"})
+        return out
+
+    def metrics(self, req: Request, op: str, status: int, error, duration_ms: float) -> list[Metric]:
+        """リクエストメトリクス。AWS と同じく、バケットにメトリクス設定がある場合だけ発行する。"""
+        bucket, key = self._locate(req)
+        b = self.buckets.get(bucket or "")
+        if b is None or not b.metrics_configs:
+            return []
+        out: list[Metric] = []
+        for filter_id, prefix in b.metrics_configs.items():
+            if prefix and not (key or req.query.get("prefix", "")).startswith(prefix):
+                continue
+            dims = {"BucketName": bucket, "FilterId": filter_id}
+            values = [("AllRequests", 1.0, "Count")]
+            kind = "ListRequests" if op.startswith("List") else REQUEST_KIND.get(req.method)
+            if kind:
+                values.append((kind, 1.0, "Count"))
+            values.append(("4xxErrors", 1.0 if 400 <= status < 500 else 0.0, "Count"))
+            values.append(("5xxErrors", 1.0 if status >= 500 else 0.0, "Count"))
+            if req.method in ("PUT", "POST") and req.body:
+                values.append(("BytesUploaded", float(len(req.body)), "Bytes"))
+            if req.ctx.get("bytes_out"):
+                values.append(("BytesDownloaded", float(req.ctx["bytes_out"]), "Bytes"))
+            values.append(("TotalRequestLatency", duration_ms, "Milliseconds"))
+            values.append(("FirstByteLatency", duration_ms, "Milliseconds"))
+            out.extend(Metric("AWS/S3", n, v, dims, u) for n, v, u in values)
+        return out
+
+    def gauges(self) -> list[Metric]:
+        """ストレージメトリクス (AWS では 1 日 1 回、日付の 0 時のタイムスタンプで発行される)。"""
+        with self.lock:
+            day = int(self.clock.now() // 86400) * 86400
+            out = []
+            for b in self.buckets.values():
+                out.append(Metric("AWS/S3", "BucketSizeBytes", float(sum(len(o.data) for o in b.objects.values())),
+                                  {"BucketName": b.name, "StorageType": "StandardStorage"}, "Bytes", day))
+                out.append(Metric("AWS/S3", "NumberOfObjects", float(len(b.objects)),
+                                  {"BucketName": b.name, "StorageType": "AllStorageTypes"}, "Count", day))
+            return out
 
     def params_for_log(self, req: Request, op: str) -> Any:
         bucket, key = self._locate(req)
@@ -294,6 +406,68 @@ class S3(Service):
     def op_GetBucketVersioning(self, req, bucket, key):
         self._bucket(bucket)
         return Response(200, xml_doc("VersioningConfiguration", ""))
+
+    def put_internal(self, bucket: str, key: str, data: bytes, content_type: str) -> str | None:
+        """AWS サービス (CloudTrail など) による書き込み。失敗時はエラーコードを返す。"""
+        with self.lock:
+            b = self.buckets.get(bucket)
+            if b is None:
+                return "NoSuchBucket"
+            b.objects[key] = S3Object(data, f'"{hashlib.md5(data).hexdigest()}"', self.clock.now(), content_type)
+            return None
+
+    # ------------------------------------------------------------------ bucket policy / metrics configuration
+    def op_PutBucketPolicy(self, req, bucket, key):
+        b = self._bucket(bucket)
+        text = self._payload(req).decode()
+        if not text.lstrip().startswith("{"):
+            raise AwsError("MalformedPolicy", "Policies must be valid JSON and the first byte must be '{'")
+        try:
+            parse_document(text, identity_policy=False)
+        except AwsError as err:
+            raise AwsError("MalformedPolicy", err.message)
+        b.policy = text
+        return Response(204)
+
+    def op_GetBucketPolicy(self, req, bucket, key):
+        b = self._bucket(bucket)
+        if not b.policy:
+            raise AwsError("NoSuchBucketPolicy", "The bucket policy does not exist", 404)
+        return Response(200, b.policy.encode(), {"Content-Type": "application/json"})
+
+    def op_DeleteBucketPolicy(self, req, bucket, key):
+        self._bucket(bucket).policy = None
+        return Response(204)
+
+    def op_PutBucketMetricsConfiguration(self, req, bucket, key):
+        b = self._bucket(bucket)
+        root = ET.fromstring(self._payload(req))
+        filt = children(root, "Filter")
+        b.metrics_configs[req.query["id"]] = (child_text(filt[0], "Prefix") or "") if filt else ""
+        return Response(204)
+
+    @staticmethod
+    def _metrics_config_xml(filter_id: str, prefix: str) -> str:
+        return tag("Id", filter_id) + (f"<Filter>{tag('Prefix', prefix)}</Filter>" if prefix else "")
+
+    def op_GetBucketMetricsConfiguration(self, req, bucket, key):
+        b = self._bucket(bucket)
+        fid = req.query["id"]
+        if fid not in b.metrics_configs:
+            raise AwsError("NoSuchConfiguration", "The specified configuration does not exist.", 404)
+        return Response(200, xml_doc("MetricsConfiguration", self._metrics_config_xml(fid, b.metrics_configs[fid])))
+
+    def op_DeleteBucketMetricsConfiguration(self, req, bucket, key):
+        b = self._bucket(bucket)
+        if b.metrics_configs.pop(req.query["id"], None) is None:
+            raise AwsError("NoSuchConfiguration", "The specified configuration does not exist.", 404)
+        return Response(204)
+
+    def op_ListBucketMetricsConfigurations(self, req, bucket, key):
+        b = self._bucket(bucket)
+        inner = "".join(f"<MetricsConfiguration>{self._metrics_config_xml(i, pfx)}</MetricsConfiguration>"
+                        for i, pfx in b.metrics_configs.items())
+        return Response(200, xml_doc("ListMetricsConfigurationsResult", tag("IsTruncated", False) + inner))
 
     def op_PutBucketVersioning(self, req, bucket, key):
         raise AwsError("NotImplemented", "Versioning is not implemented by awsemu", 501)
@@ -432,6 +606,7 @@ class S3(Service):
                      ("response-cache-control", "Cache-Control")):
             if q in req.query:
                 headers[h] = req.query[q]
+        req.ctx["bytes_out"] = len(data)
         return Response(status, data, headers)
 
     def op_HeadObject(self, req, bucket, key):
@@ -569,6 +744,8 @@ class S3(Service):
                             "content_type": o.content_type, "metadata": o.metadata}
                         for k, o in sorted(b.objects.items())
                     },
+                    "policy": json.loads(b.policy) if b.policy else None,
+                    "request_metrics_filters": b.metrics_configs,
                     "multipart_uploads": {
                         uid: {"key": u.key, "initiated": iso(u.initiated), "parts": sorted(u.parts)}
                         for uid, u in b.uploads.items()
@@ -583,6 +760,8 @@ class S3(Service):
                 name: {
                     "region": b.region,
                     "created": b.created,
+                    "policy": b.policy,
+                    "metrics_configs": b.metrics_configs,
                     "objects": {
                         k: {"data": base64.b64encode(o.data).decode(), "etag": o.etag,
                             "last_modified": o.last_modified, "content_type": o.content_type,
@@ -600,6 +779,7 @@ class S3(Service):
                     name, b["region"], b["created"],
                     {k: S3Object(base64.b64decode(o["data"]), o["etag"], o["last_modified"],
                                  o["content_type"], o["metadata"]) for k, o in b["objects"].items()},
+                    policy=b.get("policy"), metrics_configs=b.get("metrics_configs", {}),
                 )
                 for name, b in data.items()
             }

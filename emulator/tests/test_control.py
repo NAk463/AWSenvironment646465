@@ -61,5 +61,9 @@ def test_snapshot_roundtrip(client, endpoint):
 
 def test_sts(client):
     assert client("sts").get_caller_identity()["Account"] == "000000000000"
+    client("iam").create_role(RoleName="r", AssumeRolePolicyDocument=json.dumps({
+        "Version": "2012-10-17",
+        "Statement": [{"Effect": "Allow", "Principal": {"AWS": "arn:aws:iam::000000000000:root"},
+                       "Action": "sts:AssumeRole"}]}))
     creds = client("sts").assume_role(RoleArn="arn:aws:iam::000000000000:role/r", RoleSessionName="sess")
     assert creds["AssumedRoleUser"]["Arn"].endswith("assumed-role/r/sess")
