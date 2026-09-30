@@ -19,6 +19,7 @@ echo "== ツール =="
 check docker     docker --version
 check aws        aws --version
 check localstack sh -c 'localstack --version 2>/dev/null | tail -n1'
+check awsemu     awsemu --version
 check awslocal   awslocal --version
 check sam        sam --version
 check samlocal   samlocal --version
@@ -38,10 +39,12 @@ else
 fi
 
 echo "== エミュレータ =="
-if out="$(curl -fsS -m 2 http://localhost:4566/_localstack/health 2>/dev/null)"; then
+if curl -fsS -m 2 http://localhost:4566/_emulator/health >/dev/null 2>&1; then
+  echo "  awsemu       running (http://localhost:4566)"
+elif out="$(curl -fsS -m 2 http://localhost:4566/_localstack/health 2>/dev/null)"; then
   echo "  LocalStack   running ($(echo "$out" | jq -r '.edition + " " + .version' 2>/dev/null))"
 else
-  echo "  LocalStack   未起動 (docker compose up -d localstack)"
+  echo "  :4566        未起動 (awsemu serve または docker compose up -d awsemu)"
 fi
 if curl -fsS -m 2 http://localhost:5000/moto-api/ >/dev/null 2>&1; then
   echo "  Moto         running"

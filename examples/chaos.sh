@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Toxiproxy を使って LocalStack への通信に障害を注入する
+# Toxiproxy を使ってエミュレータへの通信にネットワーク障害を注入する
 #
 #   ./examples/chaos.sh latency 3000   # 3 秒の遅延 (タイムアウト・リトライ挙動の再現)
 #   ./examples/chaos.sh timeout 5000   # 5 秒後に切断 (応答なしの再現)
@@ -12,14 +12,15 @@
 set -euo pipefail
 
 API="${TOXIPROXY_API:-http://localhost:8474}"
-PROXY="localstack"
+UPSTREAM="${CHAOS_UPSTREAM:-awsemu:4566}"   # LocalStack を使う場合は localstack:4566
+PROXY="aws-endpoint"
 
 api() { curl -fsS -H 'Content-Type: application/json' "$@"; }
 
 ensure_proxy() {
   if ! api "$API/proxies/$PROXY" >/dev/null 2>&1; then
     api -X POST "$API/proxies" \
-      -d "{\"name\":\"$PROXY\",\"listen\":\"0.0.0.0:14566\",\"upstream\":\"localstack:4566\",\"enabled\":true}" >/dev/null
+      -d "{\"name\":\"$PROXY\",\"listen\":\"0.0.0.0:14566\",\"upstream\":\"$UPSTREAM\",\"enabled\":true}" >/dev/null
   fi
 }
 

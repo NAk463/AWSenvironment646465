@@ -1,11 +1,22 @@
 # AWS ローカル再現環境
-#   docker compose up -d localstack                 # LocalStack (要 Auth Token)
-#   docker compose --profile moto up -d moto        # Moto (トークン不要)
-#   docker compose --profile chaos up -d toxiproxy  # 遅延/切断などの障害注入
+#   docker compose up -d awsemu                                # 自作エミュレータ (既定, :4566)
+#   docker compose --profile chaos up -d toxiproxy             # 遅延/切断などのネットワーク障害注入
+#   docker compose --profile localstack up -d localstack       # LocalStack (要 Auth Token, awsemu と同じ 4566 番)
+#   docker compose --profile moto up -d moto                   # Moto (:5000)
 name: aws-local
 
 services:
+  awsemu:
+    build: ./emulator
+    ports:
+      - "127.0.0.1:4566:4566"
+    volumes:
+      - "awsemu-data:/data"              # 停止時に state.json へ保存し、次回起動時に復元
+    environment:
+      AWSEMU_DDB_TTL_DELAY: ${AWSEMU_DDB_TTL_DELAY:-0}
+
   localstack:
+    profiles: ["localstack"]
     image: localstack/localstack:${LOCALSTACK_VERSION:-latest}
     ports:
       - "127.0.0.1:4566:4566"            # 全サービス共通のエンドポイント
@@ -31,4 +42,7 @@ services:
     image: ghcr.io/shopify/toxiproxy:latest
     ports:
       - "127.0.0.1:8474:8474"            # 管理 API
-      - "127.0.0.1:14566:14566"          # LocalStack への障害注入用プロキシ
+      - "127.0.0.1:14566:14566"          # エミュレータへの障害注入用プロキシ
+
+volumes:
+  awsemu-data:

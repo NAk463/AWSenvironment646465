@@ -1,6 +1,5 @@
-.env
-volume/
-__pycache__/
-*.egg-info/
 .pytest_cache/
+__pycache__/
+tests/
+*.egg-info/
 build/

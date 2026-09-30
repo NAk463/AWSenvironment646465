@@ -10,6 +10,7 @@
 #   docker     Docker Engine + Compose (macOS は Colima + docker CLI)
 #   awscli     AWS CLI v2
 #   pytools    pipx 経由: localstack CLI, awslocal, samlocal/SAM CLI, tflocal
+#   awsemu     自作エミュレータ awsemu (S3/SQS/DynamoDB/STS, ./emulator)
 #   terraform  Terraform (公式バイナリ, SHA256 検証付き)
 #   cdk        Node.js + AWS CDK + cdklocal
 #   profile    ~/.aws に "localstack" プロファイルを作成
@@ -22,7 +23,7 @@ LOCAL_BIN="${HOME}/.local/bin"
 LOCAL_REGION="${AWS_LOCAL_REGION:-ap-northeast-1}"
 NODE_MAJOR="${NODE_MAJOR:-22}"
 
-ALL_COMPONENTS=(base docker awscli pytools terraform cdk profile env)
+ALL_COMPONENTS=(base docker awscli pytools awsemu terraform cdk profile env)
 PIPX_PACKAGES=(localstack awscli-local aws-sam-cli aws-sam-cli-local terraform-local)
 NPM_PACKAGES=(aws-cdk aws-cdk-local)
 
@@ -297,6 +298,17 @@ install_pytools() {
   ok "pytools (localstack, awslocal, sam, samlocal, tflocal)"
 }
 
+install_awsemu() {
+  if (( DRY_RUN )) && ! has pipx; then
+    printf '  + pipx install --force %s\n' "$SCRIPT_DIR/emulator"
+    return 0
+  fi
+  has pipx || { err "pipx が見つかりません。先に base を実行してください。"; return 1; }
+  # ローカルのソースから入れるので毎回 --force で最新の内容に置き換える
+  run pipx install --force "$SCRIPT_DIR/emulator"
+  ok "awsemu (awsemu serve で起動)"
+}
+
 install_terraform() {
   if has terraform && (( ! UPGRADE )); then
     ok "terraform は導入済みです ($(terraform version | head -n1))"
@@ -417,6 +429,7 @@ main() {
         docker)    install_docker ;;
         awscli)    install_awscli ;;
         pytools)   install_pytools ;;
+        awsemu)    install_awsemu ;;
         terraform) install_terraform ;;
         cdk)       install_cdk ;;
         profile)   configure_profile ;;
