@@ -396,7 +396,8 @@ class CloudWatch(Service):
         return f"arn:aws:cloudwatch:ap-northeast-1:{ACCOUNT_ID}:alarm:{name}"
 
     def _add_history(self, alarm: str, kind: str, summary: str, data: dict[str, Any] | None = None) -> None:
-        self.history.append({"AlarmName": alarm, "AlarmType": "MetricAlarm", "Timestamp": self.clock.now(),
+        ts = getattr(self, "_eval_time", None) or self.clock.now()
+        self.history.append({"AlarmName": alarm, "AlarmType": "MetricAlarm", "Timestamp": ts,
                              "HistoryItemType": kind, "HistorySummary": summary,
                              "HistoryData": json.dumps(data or {})})
 
@@ -458,9 +459,15 @@ class CloudWatch(Service):
         key = metric_key(a["Namespace"], a["MetricName"], a["Dimensions"])
         return self.series(key, start, end, period, a.get("Statistic") or a["ExtendedStatistic"], a.get("Unit")), period
 
-    def evaluate_alarms(self) -> None:
-        """全アラームを現在時刻で評価する (AWS では 1 分ごと)。"""
-        now = self.clock.now()
+    def evaluate_alarms(self, at: float | None = None) -> None:
+        """全アラームを評価する (AWS では 1 分ごと)。at を指定するとその時刻での評価として扱う。"""
+        self._eval_time = at
+        try:
+            self._evaluate_alarms(self.clock.now() if at is None else at)
+        finally:
+            self._eval_time = None
+
+    def _evaluate_alarms(self, now: float) -> None:
         for a in list(self.alarms.values()):
             period = int(a.get("Period") or 60)
             n, m = a["EvaluationPeriods"], a["DatapointsToAlarm"]
@@ -501,7 +508,7 @@ class CloudWatch(Service):
                    points: list[tuple[float, float]], manual: bool = False) -> None:
         if a["StateValue"] == state and not manual:
             return
-        now = self.clock.now()
+        now = getattr(self, "_eval_time", None) or self.clock.now()
         old = {"stateValue": a["StateValue"], "stateReason": a["StateReason"]}
         reason_data = {"version": "1.0", "queryDate": fmt_time(now), "statistic": a.get("Statistic"),
                        "period": period, "recentDatapoints": [v for _, v in points],

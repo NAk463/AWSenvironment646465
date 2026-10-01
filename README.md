@@ -2,7 +2,7 @@
 
 実業務で起きた AWS 関連の障害を、個人 PC 上で再現・解析するための環境です。
 
-- **awsemu** (`emulator/`): LocalStack や Moto を使わない自作の AWS エミュレータ。AWS CLI / SDK から S3・SQS・DynamoDB・IAM・STS・CloudTrail・CloudWatch・CloudWatch Logs をそのまま叩けます。現場で見るもの (アラーム、メトリクス、ログ、CloudTrail、AccessDenied) を本物と同じ形式で再現します → [emulator/README.md](emulator/README.md)
+- **awsemu** (`emulator/`): LocalStack や Moto を使わない自作の AWS エミュレータ。AWS CLI / SDK から S3・SQS・DynamoDB・IAM・STS・CloudTrail・CloudWatch・CloudWatch Logs・EC2/VPC・ALB をそのまま叩けます。現場で見るもの (アラーム、メトリクス、ログ、CloudTrail、AccessDenied) を本物と同じ形式で再現し、EC2 / VPC / ALB は Linux のネットワーク名前空間で実際に動きます (SG・NACL・ルートテーブルで実際に通信が通る/通らない) → [emulator/README.md](emulator/README.md)
 - **要件定義とロードマップ**: [docs/requirements.md](docs/requirements.md) (サーバーレス / VM・ネットワーク層 / ワークフロー / データ基盤まで段階的に拡張予定)
 - **install.sh**: AWS CLI などの周辺ツールを自動インストールします
 
@@ -30,7 +30,11 @@ awsemu time advance 60                              # 時計を早送り (アラ
 | スクリプト | 内容 |
 | --- | --- |
 | `examples/scenario-throttling-incident.sh` | 「注文 API のエラー急増」を、監視担当 (アラーム) → 運用 (メトリクス・Logs Insights) → インフラ/上級 (CloudTrail で誰が DynamoDB の容量を下げたか特定) → 復旧、の流れで追体験 |
+| `examples/scenario-alb-5xx-incident.sh` | 「Web サイトが 504 を返す」を、アラーム → ターゲットのヘルス状態 (Target.Timeout) → ALB メトリクス → VPC フローログの REJECT → CloudTrail で SG を変えた人を特定 → 復旧、の流れで追体験 (要 root / linux データプレーン) |
 | `examples/scenario-visibility-timeout.sh` | SQS の可視性タイムアウト超過による二重処理と、古い ReceiptHandle での削除が効かない問題 |
+
+EC2 / VPC / ALB を実体で動かすには root 権限が必要です (`sudo "$(command -v awsemu)" serve`、または `docker compose up -d awsemu`)。
+root が無い環境では API と状態遷移だけを再現する simulated モードで動きます。詳細は [emulator/README.md](emulator/README.md#インフラ層-ec2--vpc--alb)。
 
 ## install.sh で導入されるツール
 
@@ -64,7 +68,7 @@ awsemu time advance 60                              # 時計を早送り (アラ
 ## docker compose
 
 ```bash
-docker compose up -d awsemu                            # awsemu (:4566、停止時に状態を保存)
+docker compose up -d awsemu                            # awsemu (:4566、privileged で EC2/VPC/ALB を実体化、停止時に状態を保存)
 docker compose --profile chaos up -d toxiproxy         # ネットワーク障害注入 (:8474, :14566)
 docker compose --profile localstack up -d localstack   # LocalStack (要 Auth Token。awsemu と同じ :4566 なので排他)
 docker compose --profile moto up -d moto               # Moto (:5000)

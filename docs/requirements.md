@@ -60,7 +60,8 @@
 | 0 | S3 / SQS / DynamoDB / STS のデータプレーン、内部状態表示、障害注入、時計操作 | 完了 |
 | 1 | **観測と権限の基盤**: IAM (認証・認可・AccessDenied)、CloudTrail、CloudWatch メトリクス/アラーム、CloudWatch Logs (+Logs Insights)、各サービスの標準メトリクス、DynamoDB の容量超過による自然なスロットリング、S3 バケットポリシー / SQS キューポリシー | **完了** |
 | 2 | **サーバーレス**: Lambda (コンテナ実行、SQS/DynamoDB Streams のイベントソース、再試行・DLQ)、SNS、EventBridge、API Gateway、X-Ray (デーモン + API)、アラーム → SNS 通知 | 未着手 |
-| 3 | **インフラ層**: EC2 API、VPC/サブネット/ルートテーブル/IGW/NAT、ENI (veth)、セキュリティグループ (iptables)、インスタンス (コンテナ / KVM VM)、EBS、IMDSv2、VPC Flow Logs、EC2 メトリクス、ALB/ターゲットグループ/ヘルスチェック (502/504 の再現)、Auto Scaling、RDS (フェイルオーバー含む) | 未着手 |
+| 3a | **インフラ層 (ネットワークと計算)**: EC2 API、VPC / サブネット / ルートテーブル / IGW / NAT GW / EIP、ENI (veth)、セキュリティグループ (iptables, ステートフル)、NACL (ステートレス)、インスタンス (名前空間 + cgroup)、IMDSv2 とインスタンスプロファイル、VPC フローログ、EC2 メトリクスとステータスチェック、ALB / ターゲットグループ / ヘルスチェック (502/503/504)、ALB アクセスログ | **完了** |
+| 3b | **インフラ層 (残り)**: Auto Scaling (アラーム連動のスケール)、RDS (MySQL/PostgreSQL コンテナ、フェイルオーバー)、EBS ボリューム、NLB、HTTPS リスナー (ACM)、VPC エンドポイント / ピアリング / Transit Gateway、Route 53、KVM による本物の VM (任意)、SSM Session Manager | 未着手 |
 | 4 | **コンテナ・ワークフロー・データ**: ECS (Fargate 相当)、EKS (k3s)、Step Functions、EventBridge Scheduler、Batch、Kinesis、Firehose、Athena (DuckDB)、Glue カタログ | 未着手 |
 | 5 | **訓練シナリオ**: ロール別のシナリオパック (アラーム対応 → ログ調査 → 原因特定 → 復旧)、ゲームデイ用スクリプト | 未着手 |
 
@@ -77,3 +78,13 @@
 - [x] `aws cloudwatch put-metric-alarm` のアラームが時間経過で `ALARM` に遷移し、履歴が残る
 - [x] `aws logs put-log-events` / `filter-log-events` / `tail` / `start-query` が動き、メトリクスフィルタでログからメトリクスを作れる
 - [x] プロビジョンドモードの DynamoDB テーブルで、容量を超えると `ProvisionedThroughputExceededException` が自然に発生し、`ThrottledRequests` メトリクスに現れる
+
+## 9. フェーズ 3a の受け入れ基準 (linux データプレーン、AWS CLI で確認済み。`emulator/tests/test_netplane.py` と `examples/scenario-alb-5xx-incident.sh` に対応)
+
+- [x] `aws ec2 run-instances` のユーザーデータで起動した Web サーバーに、ホストからパブリック IP で HTTP アクセスできる
+- [x] SG で許可していないポート、パブリック IP / NAT の無いプライベートサブネットからの外向き通信は届かない
+- [x] SG 参照 (`--source-group`)、NAT ゲートウェイ経由の外向き通信、NACL のエフェメラルポート許可漏れが本物と同じ結果になる
+- [x] IMDSv2 (トークン必須) とインスタンスロールの一時認証情報で、インスタンス内から API を呼ぶと IAM が評価される
+- [x] `iam:PassRole` の不足が `UnauthorizedOperation` になり、`sts decode-authorization-message` で復号できる
+- [x] ALB のヘルスチェックが `Target.Timeout` / `Target.FailedHealthChecks` になり、502 / 503 / 504 とフェイルオープンが再現される
+- [x] `AWS/ApplicationELB`・`AWS/EC2` メトリクス、ALB アクセスログ (S3)、VPC フローログ (REJECT) で原因を追跡できる

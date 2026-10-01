@@ -40,7 +40,8 @@ fi
 
 echo "== エミュレータ =="
 if curl -fsS -m 2 http://localhost:4566/_emulator/health >/dev/null 2>&1; then
-  echo "  awsemu       running (http://localhost:4566)"
+  driver=$(curl -fsS -m 2 http://localhost:4566/_emulator/state/ec2 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin)["dataplane"]["driver"])' 2>/dev/null)
+  echo "  awsemu       running (http://localhost:4566, data plane: ${driver:-unknown})"
 elif out="$(curl -fsS -m 2 http://localhost:4566/_localstack/health 2>/dev/null)"; then
   echo "  LocalStack   running ($(echo "$out" | jq -r '.edition + " " + .version' 2>/dev/null))"
 else

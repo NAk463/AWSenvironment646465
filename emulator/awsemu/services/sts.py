@@ -88,6 +88,16 @@ class STS(QueryService):
             session = self.iam.create_session(caller, duration, "user", caller.user_name or "root")
         return {"Credentials": self._credentials(session)}
 
+    def op_DecodeAuthorizationMessage(self, p, req):
+        """EC2 などの UnauthorizedOperation に含まれるエンコード済みメッセージを復号する。"""
+        import base64
+        require(p, "EncodedMessage")
+        try:
+            decoded = base64.b64decode(p["EncodedMessage"]).decode()
+        except ValueError:
+            raise AwsError("InvalidAuthorizationMessageException", "The encoded message is invalid.")
+        return {"DecodedMessage": decoded}
+
     def reset(self) -> None:
         pass
 

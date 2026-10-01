@@ -186,7 +186,8 @@ ensure_brew() {
 install_base() {
   if [[ "$OS" == debian ]]; then
     run $SUDO apt-get update -y
-    local pkgs=(ca-certificates curl gnupg unzip jq git python3 python3-venv)
+    # iproute2 / iptables は awsemu の linux データプレーン (VPC / EC2 / ALB の実体) で使う
+    local pkgs=(ca-certificates curl gnupg unzip jq git python3 python3-venv iproute2 iptables procps)
     if apt-cache show pipx >/dev/null 2>&1; then
       pkgs+=(pipx)
     else

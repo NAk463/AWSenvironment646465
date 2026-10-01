@@ -96,6 +96,16 @@ class ManagedPolicy:
 
 
 @dataclass
+class InstanceProfile:
+    name: str
+    id: str
+    arn: str
+    path: str
+    created: float
+    roles: list[str] = field(default_factory=list)
+
+
+@dataclass
 class AccessKey:
     id: str
     secret: str
@@ -136,6 +146,7 @@ class IAM(QueryService):
             self.policies: dict[str, ManagedPolicy] = {}
             self.keys: dict[str, AccessKey] = {}
             self.sessions: dict[str, Session] = {}
+            self.profiles: dict[str, InstanceProfile] = {}
             for name, statements in AWS_MANAGED.items():
                 doc = json.dumps({"Version": "2012-10-17", "Statement": statements})
                 arn = f"arn:aws:iam::aws:policy/{name}"
@@ -373,6 +384,8 @@ class IAM(QueryService):
 
     def op_DeleteRole(self, p, req):
         r = self._entity("role", p.get("RoleName"))
+        if any(r.name in ip.roles for ip in self.profiles.values()):
+            raise AwsError("DeleteConflict", "Cannot delete entity, must remove roles from instance profile first.", 409)
         if r.inline or r.attached:
             raise AwsError("DeleteConflict", "Cannot delete entity, must detach all policies first.", 409)
         del self.roles[r.name]
@@ -501,6 +514,66 @@ class IAM(QueryService):
         e = self._entity(kind, p.get(f"{kind.capitalize()}Name"))
         return {"PolicyNames": sorted(e.inline), "IsTruncated": False}
 
+    # ================================================================== instance profiles
+    def profile_by_arn_or_name(self, arn: str | None = None, name: str | None = None) -> InstanceProfile | None:
+        if name:
+            return self.profiles.get(name)
+        return next((ip for ip in self.profiles.values() if ip.arn == arn), None)
+
+    def _profile(self, name: str | None) -> InstanceProfile:
+        ip = self.profiles.get(name or "")
+        if ip is None:
+            raise AwsError("NoSuchEntity", f"Instance Profile {name} cannot be found.", 404)
+        return ip
+
+    def _profile_xml(self, ip: InstanceProfile) -> dict[str, Any]:
+        return {"Path": ip.path, "InstanceProfileName": ip.name, "InstanceProfileId": ip.id, "Arn": ip.arn,
+                "CreateDate": iso(ip.created),
+                "Roles": [self._role_xml(self.roles[r]) for r in ip.roles if r in self.roles]}
+
+    def op_CreateInstanceProfile(self, p, req):
+        require(p, "InstanceProfileName")
+        name = p["InstanceProfileName"]
+        if name in self.profiles:
+            raise AwsError("EntityAlreadyExists", f"Instance Profile {name} already exists.", 409)
+        path = p.get("Path") or "/"
+        ip = InstanceProfile(name, new_id("AIPA"), f"arn:aws:iam::{ACCOUNT_ID}:instance-profile{path}{name}", path,
+                             self.clock.now())
+        self.profiles[name] = ip
+        return {"InstanceProfile": self._profile_xml(ip)}
+
+    def op_GetInstanceProfile(self, p, req):
+        return {"InstanceProfile": self._profile_xml(self._profile(p.get("InstanceProfileName")))}
+
+    def op_ListInstanceProfiles(self, p, req):
+        return {"InstanceProfiles": [self._profile_xml(ip) for ip in sorted(self.profiles.values(),
+                                                                            key=lambda x: x.name)],
+                "IsTruncated": False}
+
+    def op_ListInstanceProfilesForRole(self, p, req):
+        role = self._entity("role", p.get("RoleName"))
+        return {"InstanceProfiles": [self._profile_xml(ip) for ip in self.profiles.values() if role.name in ip.roles],
+                "IsTruncated": False}
+
+    def op_DeleteInstanceProfile(self, p, req):
+        ip = self._profile(p.get("InstanceProfileName"))
+        if ip.roles:
+            raise AwsError("DeleteConflict", "Cannot delete entity, must remove roles from instance profile first.", 409)
+        del self.profiles[ip.name]
+
+    def op_AddRoleToInstanceProfile(self, p, req):
+        ip = self._profile(p.get("InstanceProfileName"))
+        role = self._entity("role", p.get("RoleName"))
+        if ip.roles:
+            raise AwsError("LimitExceeded", "Cannot exceed quota for InstanceSessionsPerInstanceProfile: 1", 409)
+        ip.roles.append(role.name)
+
+    def op_RemoveRoleFromInstanceProfile(self, p, req):
+        ip = self._profile(p.get("InstanceProfileName"))
+        if p.get("RoleName") not in ip.roles:
+            raise AwsError("NoSuchEntity", f"The role with name {p.get('RoleName')} cannot be found.", 404)
+        ip.roles.remove(p["RoleName"])
+
     # ================================================================== simulation
     def _simulate(self, identity: Identity, policies: list[dict[str, Any]], p: dict[str, Any],
                   req: Request) -> dict[str, Any]:
@@ -579,6 +652,7 @@ class IAM(QueryService):
                           for r in self.roles.values()},
                 "customer_managed_policies": {p.arn: json.loads(p.versions[p.default][0])
                                               for p in self.policies.values() if not p.aws_managed},
+                "instance_profiles": {ip.name: {"arn": ip.arn, "roles": ip.roles} for ip in self.profiles.values()},
                 "active_sessions": [{"access_key": s.access_key, "arn": s.identity.arn,
                                      "expires_in_seconds": round(s.expiration - now)}
                                     for s in self.sessions.values() if s.expiration > now],
@@ -591,6 +665,7 @@ class IAM(QueryService):
                 "entities": [e.__dict__ for t in (self.users, self.groups, self.roles) for e in t.values()],
                 "policies": [p.__dict__ for p in self.policies.values() if not p.aws_managed],
                 "keys": [k.__dict__ for k in self.keys.values()],
+                "profiles": [ip.__dict__ for ip in self.profiles.values()],
                 "sessions": [{**s.__dict__, "identity": s.identity.__dict__} for s in self.sessions.values()],
             }
 
@@ -602,6 +677,8 @@ class IAM(QueryService):
             for p in data.get("policies", []):
                 pol = ManagedPolicy(**{**p, "versions": {k: tuple(v) for k, v in p["versions"].items()}})
                 self.policies[pol.arn] = pol
+            for ip in data.get("profiles", []):
+                self.profiles[ip["name"]] = InstanceProfile(**ip)
             for k in data.get("keys", []):
                 self.keys[k["id"]] = AccessKey(**k)
             for s in data.get("sessions", []):

@@ -9,7 +9,7 @@ from awsemu.server import make_server
 
 @pytest.fixture(scope="session")
 def server():
-    srv = make_server("127.0.0.1", 0, verbose=False, background=False)
+    srv = make_server("127.0.0.1", 0, verbose=False, background=False, network="simulated")
     thread = threading.Thread(target=srv.serve_forever, daemon=True)
     thread.start()
     yield srv

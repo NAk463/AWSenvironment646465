@@ -7,6 +7,8 @@
   python -m awsemu fault list | fault rm <id> | fault clear
   python -m awsemu time advance 60
   python -m awsemu config [--iam enforce|off] [--root-keys test,admin]
+  python -m awsemu exec i-xxxx -- ps aux          (インスタンス内でコマンド実行。引数なしでシェル)
+  python -m awsemu impair i-xxxx system|instance|recover
   python -m awsemu reset [--service s3]
   python -m awsemu snapshot save FILE | snapshot load FILE
 """
@@ -45,10 +47,18 @@ def show(data: Any) -> None:
 
 
 def cmd_serve(args: argparse.Namespace) -> None:
+    import threading
+
+    from .netplane.linux import HOST_IP
     from .server import make_server
 
-    server = make_server(args.host, args.port, verbose=not args.quiet)
+    server = make_server(args.host, args.port, verbose=not args.quiet, network=args.network)
     emu = server.emulator  # type: ignore[attr-defined]
+    emu.api_port = args.port
+    servers = [server]
+    if emu.ec2.netplane.enabled and args.host not in ("0.0.0.0", HOST_IP):
+        # インスタンス (VPC 内) から AWS API を呼べるよう、"インターネット側" のアドレスでも待ち受ける
+        servers.append(make_server(HOST_IP, args.port, emulator=emu, verbose=not args.quiet, background=False))
     if args.state_file and os.path.exists(args.state_file):
         with open(args.state_file, encoding="utf-8") as f:
             emu.load(json.load(f))
@@ -61,12 +71,19 @@ def cmd_serve(args: argparse.Namespace) -> None:
                 json.dump(emu.dump(), f, ensure_ascii=False)
             os.replace(tmp, args.state_file)
             print(f"state saved to {args.state_file}", file=sys.stderr)
+        emu.shutdown()
         sys.exit(0)
 
     signal.signal(signal.SIGTERM, shutdown)
     signal.signal(signal.SIGINT, shutdown)
+    np = emu.ec2.netplane
     print(f"awsemu listening on http://{args.host}:{args.port}  (services: {', '.join(sorted(emu.services))}, "
           f"iam={emu.iam_mode})", file=sys.stderr)
+    print(f"data plane: {np.name}" + (f" ({np.reason})" if not np.enabled and getattr(np, 'reason', '') else
+                                       f" (API for instances: http://{HOST_IP}:{args.port})" if np.enabled else ""),
+          file=sys.stderr)
+    for extra in servers[1:]:
+        threading.Thread(target=extra.serve_forever, daemon=True).start()
     server.serve_forever()
 
 
@@ -133,6 +150,21 @@ def cmd_snapshot(args: argparse.Namespace) -> None:
             show(call(args.url, "PUT", "snapshot", json.load(f)))
 
 
+def cmd_exec(args: argparse.Namespace) -> None:
+    """インスタンスの中でコマンドを実行する (SSH / Session Manager の代わり)。ホストで root 権限が必要。"""
+    pid = call(args.url, "GET", f"ec2/instances/{args.instance_id}/pid")["pid"]
+    command = args.command or ["/bin/bash", "-l"]
+    if command and command[0] == "--":
+        command = command[1:] or ["/bin/bash", "-l"]
+    root = os.path.join("/var/lib/awsemu/instances", args.instance_id)
+    os.chdir(root if os.path.isdir(root) else "/")
+    os.execvp("nsenter", ["nsenter", "-t", str(pid), "--pid", "--mount", "--uts", "--net", "--", *command])
+
+
+def cmd_impair(args: argparse.Namespace) -> None:
+    show(call(args.url, "POST", "ec2/impair", {"instance_id": args.instance_id, "kind": args.kind}))
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(prog="awsemu", description="自作 AWS エミュレータ")
     parser.add_argument("--version", action="version", version=f"awsemu {__version__}")
@@ -145,6 +177,8 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--state-file", default=os.environ.get("AWSEMU_STATE_FILE"),
                    help="起動時に読み込み、終了時に保存する状態ファイル")
     p.add_argument("--quiet", action="store_true", help="リクエストログを出力しない")
+    p.add_argument("--network", choices=["auto", "linux", "simulated"], default=os.environ.get("AWSEMU_NETWORK", "auto"),
+                   help="データプレーン。linux: 名前空間で実体を作る (要 root) / simulated: 状態のみ / auto: 可能なら linux")
     p.set_defaults(func=cmd_serve)
 
     p = sub.add_parser("state", help="内部状態を表示する")
@@ -186,6 +220,16 @@ def main(argv: list[str] | None = None) -> None:
     p.set_defaults(func=lambda a: show(call(a.url, "POST", "config", {
         **({"iam": a.iam} if a.iam else {}),
         **({"root_access_keys": a.root_keys.split(",")} if a.root_keys else {})})))
+
+    p = sub.add_parser("exec", help="EC2 インスタンスの中でコマンドを実行する (引数なしならシェル)")
+    p.add_argument("instance_id")
+    p.add_argument("command", nargs=argparse.REMAINDER)
+    p.set_defaults(func=cmd_exec)
+
+    p = sub.add_parser("impair", help="EC2 インスタンスに障害を起こす (system / instance / recover)")
+    p.add_argument("instance_id")
+    p.add_argument("kind", choices=["system", "instance", "recover"])
+    p.set_defaults(func=cmd_impair)
 
     p = sub.add_parser("reset", help="状態を初期化する")
     p.add_argument("--service")

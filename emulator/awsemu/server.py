@@ -25,6 +25,8 @@ from .iam_policy import base_context, denial_message
 from .services.cloudtrail import CloudTrail
 from .services.cloudwatch import CloudWatch
 from .services.dynamodb import DynamoDB
+from .services.ec2 import EC2
+from .services.elbv2 import ELBv2
 from .services.iam import IAM
 from .services.logs import Logs
 from .services.s3 import S3
@@ -35,9 +37,10 @@ CREDENTIAL_RE = re.compile(r"Credential=([^/,\s]+)/\d{8}/([^/]+)/([^/]+)/aws4_re
 QUERY_CREDENTIAL_RE = re.compile(r"^([^/]+)/\d{8}/([^/]+)/([^/]+)/aws4_request$")
 CONTROL_PREFIX = "/_emulator"
 MAX_LOGGED_PARAMS = 4000
-SERVICE_CLASSES = (S3, SQS, DynamoDB, STS, IAM, CloudTrail, CloudWatch, Logs)
+SERVICE_CLASSES = (S3, SQS, DynamoDB, STS, IAM, CloudTrail, CloudWatch, Logs, EC2, ELBv2)
 SCOPE_TO_SERVICE = {"s3": "s3", "sqs": "sqs", "dynamodb": "dynamodb", "sts": "sts", "iam": "iam",
-                    "monitoring": "cloudwatch", "logs": "logs", "cloudtrail": "cloudtrail"}
+                    "monitoring": "cloudwatch", "logs": "logs", "cloudtrail": "cloudtrail", "ec2": "ec2",
+                    "elasticloadbalancing": "elbv2"}
 TARGET_TO_SERVICE = (("DynamoDB_", "dynamodb"), ("AmazonSQS", "sqs"), ("Logs_", "logs"),
                      ("com.amazonaws.cloudtrail", "cloudtrail"), ("GraniteServiceVersion20100801", "cloudwatch"))
 
@@ -61,7 +64,7 @@ def credential_scope(req: Request) -> tuple[str | None, str | None, str | None]:
 
 
 class Emulator:
-    def __init__(self, iam_mode: str | None = None) -> None:
+    def __init__(self, iam_mode: str | None = None, network: str | None = None) -> None:
         self.clock = Clock()
         self.events = EventLog()
         self.faults = FaultInjector()
@@ -74,6 +77,16 @@ class Emulator:
         self.metrics_interval = float(os.environ.get("AWSEMU_METRICS_INTERVAL", "60"))
         self.started = time.time()
         self._stop = threading.Event()
+        self.api_port = 4566
+        self.ec2.start(network)
+
+    @property
+    def ec2(self) -> EC2:
+        return self.services["ec2"]  # type: ignore[return-value]
+
+    def shutdown(self) -> None:
+        self._stop.set()
+        self.ec2.shutdown()
 
     @property
     def iam(self) -> IAM:
@@ -92,9 +105,6 @@ class Emulator:
                 except Exception:  # noqa: BLE001
                     traceback.print_exc()
         threading.Thread(target=loop, name="awsemu-sampler", daemon=True).start()
-
-    def stop(self) -> None:
-        self._stop.set()
 
     def tick(self, at: float | None = None) -> None:
         """ゲージ系メトリクス (キュー滞留数など) をサンプリングし、アラームを評価する。"""
@@ -119,6 +129,14 @@ class Emulator:
             for m in metrics:
                 m.timestamp = float(t)
             self.cloudwatch.ingest(metrics)
+            # 経過した各分の時点でアラームを評価する (途中で ALARM になって戻った履歴も残る)
+            with self.cloudwatch.lock:
+                self.cloudwatch.evaluate_alarms(at=float(t) + 1)
+        # 時間が経過したものとして、定期配信されるログ (ALB アクセスログ・フローログ) を書き出す
+        with self.services["elbv2"].lock:
+            self.services["elbv2"].flush_access_logs()
+        if self.ec2.flowlogs_collector:
+            self.ec2.flowlogs_collector.flush()
         self.tick()
 
     def alarm_action(self, arn: str, alarm: dict[str, Any]) -> tuple[bool, str]:
@@ -192,8 +210,10 @@ class Emulator:
             if not decision.allowed:
                 if ident.type == "Anonymous":
                     return AwsError(svc.access_denied_code, "Access Denied", svc.access_denied_status)
-                return AwsError(svc.access_denied_code, denial_message(ident, action, resource, decision),
-                                svc.access_denied_status)
+                message = denial_message(ident, action, resource, decision)
+                if hasattr(svc, "format_denial"):
+                    message = svc.format_denial(message, ident, action, resource, decision)
+                return AwsError(svc.access_denied_code, message, svc.access_denied_status)
         return None
 
     # ------------------------------------------------------------------ dispatch
@@ -339,6 +359,16 @@ class Emulator:
                     self.iam.root_keys = set(body["root_access_keys"])
             return _json({"iam": self.iam_mode, "root_access_keys": sorted(self.iam.root_keys),
                           "metrics_interval_seconds": self.metrics_interval})
+        if head == "ec2" and m == "GET" and len(parts) == 4 and parts[1] == "instances" and parts[3] == "pid":
+            pid = self.ec2.netplane.instance_pid(parts[2]) if self.ec2.netplane.enabled else None
+            if pid is None:
+                return _json({"error": f"instance {parts[2]} has no running process (linux data plane only)"}, 404)
+            return _json({"instance_id": parts[2], "pid": pid})
+        if head == "ec2" and m == "POST" and len(parts) > 1 and parts[1] == "impair":
+            try:
+                return _json(self.ec2.impair(body.get("instance_id", ""), body.get("kind", "")))
+            except AwsError as err:
+                return _json({"error": err.message}, 400)
         if head == "tick" and m == "POST":
             self.tick()
             return _json({"sampled": True})
@@ -406,10 +436,11 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def make_server(host: str, port: int, emulator: Emulator | None = None, verbose: bool = True,
-                background: bool = True) -> ThreadingHTTPServer:
-    emulator = emulator or Emulator()
+                background: bool = True, network: str | None = None) -> ThreadingHTTPServer:
+    emulator = emulator or Emulator(network=network)
     if background:
         emulator.start_background()
+        emulator.services["elbv2"].start_checker()
     handler = type("BoundHandler", (Handler,), {"emulator": emulator, "verbose": verbose})
     server = ThreadingHTTPServer((host, port), handler)
     server.daemon_threads = True

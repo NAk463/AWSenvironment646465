@@ -8,6 +8,7 @@ name: aws-local
 services:
   awsemu:
     build: ./emulator
+    privileged: true                     # VPC / EC2 / ALB をネットワーク名前空間で実体化するために必要
     ports:
       - "127.0.0.1:4566:4566"
     volumes:
@@ -16,6 +17,8 @@ services:
       AWSEMU_IAM: ${AWSEMU_IAM:-enforce}                 # off にすると認証・認可を行わない
       AWSEMU_ROOT_ACCESS_KEYS: ${AWSEMU_ROOT_ACCESS_KEYS:-test}
       AWSEMU_DDB_TTL_DELAY: ${AWSEMU_DDB_TTL_DELAY:-0}
+      AWSEMU_NETWORK: ${AWSEMU_NETWORK:-auto}            # simulated にすると EC2 などは状態のみ (privileged 不要)
+      AWSEMU_INTERNET: ${AWSEMU_INTERNET:-0}             # 1 にするとインスタンスから実インターネットへ出られる
 
   localstack:
     profiles: ["localstack"]
