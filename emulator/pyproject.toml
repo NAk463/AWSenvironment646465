@@ -17,3 +17,6 @@ awsemu = "awsemu.__main__:main"
 
 [tool.setuptools.packages.find]
 include = ["awsemu*"]
+
+[tool.setuptools.package-data]
+awsemu = ["models/*.json"]
